@@ -17,6 +17,7 @@ interface SessionsData {
 }
 
 let sessionsCache: SessionsData | null = null;
+let writeMutex: Promise<void> = Promise.resolve();
 
 async function loadSessions(): Promise<SessionsData> {
   if (sessionsCache) return sessionsCache;
@@ -31,7 +32,11 @@ async function loadSessions(): Promise<SessionsData> {
 
 async function saveSessions(data: SessionsData): Promise<void> {
   sessionsCache = data;
-  await Bun.write(SESSIONS_FILE, JSON.stringify(data, null, 2) + "\n");
+  // Serialize writes to prevent concurrent read-modify-write corruption
+  const snapshot = JSON.stringify(data, null, 2) + "\n";
+  const prev = writeMutex;
+  writeMutex = prev.then(() => Bun.write(SESSIONS_FILE, snapshot));
+  await writeMutex;
 }
 
 /** Get session for a thread. Returns null if no session exists yet. */

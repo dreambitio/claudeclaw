@@ -118,6 +118,9 @@ let applicationId: string | null = null;
 // Track guilds we were already in before this session to avoid duplicate welcome messages
 let readyGuildIds: Set<string> | null = null;
 
+// Ensure startup message is sent only once per fresh connect
+let startupMessageSent = false;
+
 // Track known thread channel IDs and their parent channel IDs for multi-session support
 const knownThreads = new Map<string, { parentId: string }>();
 
@@ -139,7 +142,7 @@ async function discordApi<T>(
   endpoint: string,
   body?: unknown,
 ): Promise<T> {
-  const res = await fetch(`${DISCORD_API}${endpoint}`, {
+  let res = await fetch(`${DISCORD_API}${endpoint}`, {
     method,
     headers: {
       Authorization: `Bot ${token}`,
@@ -148,13 +151,20 @@ async function discordApi<T>(
     body: body ? JSON.stringify(body) : undefined,
   });
 
-  // Rate limit handling
-  if (res.status === 429) {
+  // Rate limit handling — loop instead of recursion, cap retry at 30s
+  while (res.status === 429) {
     const data = (await res.json()) as { retry_after: number };
-    const retryMs = Math.ceil(data.retry_after * 1000);
+    const retryMs = Math.min(Math.ceil(data.retry_after * 1000), 30_000);
     debugLog(`Rate limited on ${method} ${endpoint}, retrying in ${retryMs}ms`);
     await Bun.sleep(retryMs);
-    return discordApi(token, method, endpoint, body);
+    res = await fetch(`${DISCORD_API}${endpoint}`, {
+      method,
+      headers: {
+        Authorization: `Bot ${token}`,
+        "Content-Type": "application/json",
+      },
+      body: body ? JSON.stringify(body) : undefined,
+    });
   }
 
   if (!res.ok) {
@@ -485,20 +495,20 @@ Rules:
 - Return ONLY valid JSON or the word null. No explanation.`;
 
   try {
-    const { execSync } = await import("node:child_process");
     const input = `${systemPrompt}\n\n---\nUser message: ${text}`;
-    const result = execSync(
-      `claude --model claude-sonnet-4-20250514 --print --output-format text`,
+    const proc = Bun.spawn(
+      ["claude", "--model", "claude-sonnet-4-20250514", "--print", "--output-format", "text"],
       {
-        input,
-        encoding: "utf-8",
-        timeout: 15000,
+        stdin: new Response(input).body!,
+        stdout: "pipe",
+        stderr: "pipe",
         env: { ...process.env, HOME: homedir() },
       },
-    ).trim();
+    );
+    const result = (await new Response(proc.stdout).text()).trim();
+    await proc.exited;
 
     if (!result || result === "null") return null;
-    // Extract JSON from response (in case there's extra text)
     const jsonMatch = result.match(/\{[\s\S]*\}/);
     if (!jsonMatch) return null;
     return JSON.parse(jsonMatch[0]) as ThreadIntent;
@@ -676,8 +686,9 @@ async function handleMessageCreate(token: string, message: DiscordMessage): Prom
     if (processedMessageIds.has(message.id)) return;
     processedMessageIds.add(message.id);
     if (processedMessageIds.size > 2000) {
-      const [oldest] = processedMessageIds;
-      processedMessageIds.delete(oldest);
+      for (const id of [...processedMessageIds].slice(0, 500)) {
+        processedMessageIds.delete(id);
+      }
     }
   }
 
@@ -1511,6 +1522,7 @@ async function ensureChannelProject(channel: { id: string; name?: string; type?:
   const { existsSync } = await import("node:fs");
   if (!existsSync(claudeMdPath)) {
     const displayName = channel.name ?? channel.id;
+    const jobsDir = join(process.cwd(), ".claude", "claudeclaw", "jobs");
     const content = `# Channel: ${displayName}
 
 This is the project workspace for Discord channel **#${displayName}** (ID: ${channel.id}).
@@ -1522,7 +1534,7 @@ Work here is scoped to this channel's context and history.
 You can create scheduled jobs for this channel. Jobs live at:
 
 \`\`\`
-/Users/assist/claudeclaw_home/.claude/claudeclaw/jobs/
+${jobsDir}
 \`\`\`
 
 ### Job file format
@@ -1548,7 +1560,7 @@ Your prompt here. This runs in the #${displayName} channel session.
 
 ### Managing jobs
 
-- **List:** \`ls /Users/assist/claudeclaw_home/.claude/claudeclaw/jobs/\`
+- **List:** \`ls ${jobsDir}\`
 - **View:** read the \`.md\` file
 
 ### Creating/deleting jobs via directives
@@ -1642,6 +1654,8 @@ function stopHeartbeat(): void {
 }
 
 async function sendStartupMessage(token: string): Promise<void> {
+  if (startupMessageSent) return;
+  startupMessageSent = true;
   const filePath = join(process.cwd(), ".claude", "claudeclaw", "startup-message.txt");
   let text: string;
   try {
@@ -1695,6 +1709,7 @@ function resetGatewayState(): void {
   lastSequence = null;
   gatewaySessionId = null;
   readyGuildIds = null;
+  startupMessageSent = false;
   botUserId = null;
   botUsername = null;
   applicationId = null;
