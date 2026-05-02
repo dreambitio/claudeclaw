@@ -1,0 +1,19 @@
+{
+  "name": "claudeclaw",
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "start": "bun run src/index.ts",
+    "dev:web": "bun --watch src/index.ts start --web --replace-existing",
+    "telegram": "bun run src/index.ts telegram",
+    "discord": "bun run src/index.ts discord",
+    "status": "bun run src/index.ts status"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.3.9"
+  },
+  "dependencies": {
+    "ogg-opus-decoder": "^1.7.3",
+    "xlsx": "^0.18.5"
+  }
+}

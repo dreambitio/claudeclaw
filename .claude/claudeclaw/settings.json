@@ -1,0 +1,117 @@
+{
+  "model": "",
+  "api": "",
+  "fallback": {
+    "model": "",
+    "api": ""
+  },
+  "agentic": {
+    "enabled": false,
+    "defaultMode": "implementation",
+    "modes": [
+      {
+        "name": "planning",
+        "model": "opus",
+        "keywords": [
+          "plan",
+          "design",
+          "architect",
+          "strategy",
+          "approach",
+          "research",
+          "investigate",
+          "analyze",
+          "explore",
+          "understand",
+          "think",
+          "consider",
+          "evaluate",
+          "assess",
+          "review",
+          "system design",
+          "trade-off",
+          "decision",
+          "choose",
+          "compare",
+          "brainstorm",
+          "ideate",
+          "concept",
+          "proposal"
+        ],
+        "phrases": [
+          "how to implement",
+          "how should i",
+          "what's the best way to",
+          "should i",
+          "which approach",
+          "help me decide",
+          "help me understand"
+        ]
+      },
+      {
+        "name": "implementation",
+        "model": "sonnet",
+        "keywords": [
+          "implement",
+          "code",
+          "write",
+          "create",
+          "build",
+          "add",
+          "fix",
+          "debug",
+          "refactor",
+          "update",
+          "modify",
+          "change",
+          "deploy",
+          "run",
+          "execute",
+          "install",
+          "configure",
+          "test",
+          "commit",
+          "push",
+          "merge",
+          "release",
+          "generate",
+          "scaffold",
+          "setup",
+          "initialize"
+        ]
+      }
+    ]
+  },
+  "timezone": "UTC",
+  "timezoneOffsetMinutes": 0,
+  "heartbeat": {
+    "enabled": false,
+    "interval": 15,
+    "prompt": "",
+    "excludeWindows": [],
+    "forwardToTelegram": true
+  },
+  "telegram": {
+    "token": "",
+    "allowedUserIds": []
+  },
+  "discord": {
+    "token": "",
+    "allowedUserIds": [],
+    "listenChannels": []
+  },
+  "security": {
+    "level": "moderate",
+    "allowedTools": [],
+    "disallowedTools": []
+  },
+  "web": {
+    "enabled": false,
+    "host": "127.0.0.1",
+    "port": 4632
+  },
+  "stt": {
+    "baseUrl": "",
+    "model": ""
+  }
+}
