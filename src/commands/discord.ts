@@ -127,6 +127,10 @@ const knownThreads = new Map<string, { parentId: string }>();
 // Dedup set to prevent double-processing gateway duplicates
 const processedMessageIds = new Set<string>();
 
+// Dedup map for task threads: `${parentChannelId}:${taskId}` → threadId
+// Populated from active threads on GUILD_CREATE and on every successful postTaskAnnouncement
+const taskIdToThread = new Map<string, string>();
+
 // --- Debug ---
 
 function debugLog(message: string): void {
@@ -276,11 +280,18 @@ export async function postTaskAnnouncement(
   taskId: string,
   taskTitle: string,
 ): Promise<{ announcementMessageId: string; threadId: string }> {
+  const dedupKey = `${channelId}:${taskId}`;
+  const existing = taskIdToThread.get(dedupKey);
+  if (existing) {
+    console.log(`[Discord] Task thread reused: ${existing} for ${taskId} in ${channelId} (dedup)`);
+    return { announcementMessageId: "", threadId: existing };
+  }
   const text = `📋 **${taskId}: ${taskTitle}**\nСтатус: розпочато`;
   const msgId = await sendMessage(token, channelId, text);
   if (!msgId) throw new Error(`postTaskAnnouncement: sendMessage returned null for ${taskId}`);
   const threadId = await createThreadFromMessage(token, channelId, msgId, `${taskId}: ${taskTitle}`);
   knownThreads.set(threadId, { parentId: channelId });
+  taskIdToThread.set(dedupKey, threadId);
   console.log(`[Discord] Task thread created: ${threadId} for ${taskId} in ${channelId}`);
   return { announcementMessageId: msgId, threadId };
 }
@@ -771,15 +782,18 @@ async function handleMessageCreate(token: string, message: DiscordMessage): Prom
   try {
     await sendTyping(config.token, channelId);
 
-    let imagePath: string | null = null;
+    const imagePaths: string[] = [];
     let voicePath: string | null = null;
     let voiceTranscript: string | null = null;
 
     if (hasImage) {
-      try {
-        imagePath = await downloadDiscordAttachment(imageAttachments[0], "image");
-      } catch (err) {
-        console.error(`[Discord] Failed to download image for ${label}: ${err instanceof Error ? err.message : err}`);
+      for (const att of imageAttachments) {
+        try {
+          const p = await downloadDiscordAttachment(att, "image");
+          if (p) imagePaths.push(p);
+        } catch (err) {
+          console.error(`[Discord] Failed to download image for ${label}: ${err instanceof Error ? err.message : err}`);
+        }
       }
     }
 
@@ -948,9 +962,15 @@ async function handleMessageCreate(token: string, message: DiscordMessage): Prom
     } else if (cleanContent.trim()) {
       promptParts.push(`Message: ${cleanContent}`);
     }
-    if (imagePath) {
-      promptParts.push(`Image path: ${imagePath}`);
-      promptParts.push("The user attached an image. Inspect this image file directly before answering.");
+    if (imagePaths.length > 0) {
+      for (const p of imagePaths) {
+        promptParts.push(`Image path: ${p}`);
+      }
+      promptParts.push(
+        imagePaths.length === 1
+          ? "The user attached an image. Inspect this image file directly before answering."
+          : `The user attached ${imagePaths.length} images. Inspect each image file directly before answering.`,
+      );
     } else if (hasImage) {
       promptParts.push("The user attached an image, but downloading it failed. Respond and ask them to resend.");
     }
@@ -1777,6 +1797,12 @@ function handleDispatch(token: string, eventName: string, data: any): void {
         console.log(`[Discord] GUILD_CREATE: ${data.threads.length} active threads in guild ${data.id}`);
         for (const thread of data.threads) {
           knownThreads.set(thread.id, { parentId: thread.parent_id });
+          // Populate task dedup cache from thread name (e.g. "TASK-109: Перейменувати...")
+          const taskMatch = typeof thread.name === "string" ? thread.name.match(/^(TASK-\d+):/) : null;
+          if (taskMatch) {
+            const key = `${thread.parent_id}:${taskMatch[1]}`;
+            if (!taskIdToThread.has(key)) taskIdToThread.set(key, thread.id);
+          }
           // Rejoin unconditionally — Discord only delivers MESSAGE_CREATE to thread members
           discordApi(token, "PUT", `/channels/${thread.id}/thread-members/@me`).catch((err) =>
             console.error(`[Discord] Failed to rejoin thread ${thread.id}: ${err}`)
@@ -1840,6 +1866,11 @@ function handleDispatch(token: string, eventName: string, data: any): void {
     case "THREAD_CREATE":
       if (data.id && data.parent_id) {
         knownThreads.set(data.id, { parentId: data.parent_id });
+        const taskMatch = typeof data.name === "string" ? data.name.match(/^(TASK-\d+):/) : null;
+        if (taskMatch) {
+          const key = `${data.parent_id}:${taskMatch[1]}`;
+          if (!taskIdToThread.has(key)) taskIdToThread.set(key, data.id);
+        }
         debugLog(`Thread tracked: ${data.id} (parent: ${data.parent_id})`);
       }
       break;
@@ -1847,6 +1878,10 @@ function handleDispatch(token: string, eventName: string, data: any): void {
     case "THREAD_DELETE":
       if (data.id) {
         knownThreads.delete(data.id);
+        // Drop dedup cache entries that point to this thread
+        for (const [key, tid] of taskIdToThread) {
+          if (tid === data.id) taskIdToThread.delete(key);
+        }
         removeThreadSession(data.id).catch((err) =>
           console.error(`[Discord] Failed to cleanup thread session: ${err}`),
         );
