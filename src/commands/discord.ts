@@ -295,7 +295,7 @@ export async function postTaskAnnouncement(
   console.log(`[Discord] Task thread created: ${threadId} for ${taskId} in ${channelId}`);
   return { announcementMessageId: msgId, threadId };
 }
-async function sendFileToChannel(
+export async function sendFileToChannel(
   token: string,
   channelId: string,
   filePath: string,
@@ -321,7 +321,7 @@ async function sendFileToChannel(
   }
 }
 
-function extractSendFileDirectives(text: string): {
+export function extractSendFileDirectives(text: string): {
   cleanedText: string;
   filePaths: string[];
 } {
@@ -562,8 +562,13 @@ function isTextFileAttachment(a: DiscordAttachment): boolean {
   return true;
 }
 
+function isPdfAttachment(a: DiscordAttachment): boolean {
+  if (a.content_type === "application/pdf") return true;
+  return extname(a.filename).toLowerCase() === ".pdf";
+}
+
 function isBinaryFileAttachment(a: DiscordAttachment): boolean {
-  if (isImageAttachment(a) || isVoiceAttachment(a) || isTextFileAttachment(a)) return false;
+  if (isImageAttachment(a) || isVoiceAttachment(a) || isTextFileAttachment(a) || isPdfAttachment(a)) return false;
   return true;
 }
 
@@ -577,7 +582,7 @@ function getBinaryFileHint(filename: string): string {
 
 async function downloadDiscordAttachment(
   attachment: DiscordAttachment,
-  type: "image" | "voice",
+  type: "image" | "voice" | "pdf",
 ): Promise<string | null> {
   const dir = join(process.cwd(), ".claude", "claudeclaw", "inbox", "discord");
   await mkdir(dir, { recursive: true });
@@ -585,7 +590,8 @@ async function downloadDiscordAttachment(
   const response = await fetch(attachment.url);
   if (!response.ok) throw new Error(`Discord attachment download failed: ${response.status}`);
 
-  const ext = extname(attachment.filename) || (type === "voice" ? ".ogg" : ".jpg");
+  const defaultExt = type === "voice" ? ".ogg" : type === "pdf" ? ".pdf" : ".jpg";
+  const ext = extname(attachment.filename) || defaultExt;
   const filename = `${attachment.id}-${Date.now()}${ext}`;
   const localPath = join(dir, filename);
 
@@ -754,10 +760,12 @@ async function handleMessageCreate(token: string, message: DiscordMessage): Prom
   // Detect attachments
   const imageAttachments = message.attachments.filter(isImageAttachment);
   const voiceAttachments = message.attachments.filter(isVoiceAttachment);
+  const pdfAttachments = message.attachments.filter(isPdfAttachment);
   const textFileAttachments = message.attachments.filter(isTextFileAttachment);
   const binaryFileAttachments = message.attachments.filter(isBinaryFileAttachment);
   const hasImage = imageAttachments.length > 0;
   const hasVoice = voiceAttachments.length > 0;
+  const hasPdf = pdfAttachments.length > 0;
   const hasTextFile = textFileAttachments.length > 0;
   const hasBinaryFile = binaryFileAttachments.length > 0;
 
@@ -783,6 +791,7 @@ async function handleMessageCreate(token: string, message: DiscordMessage): Prom
     await sendTyping(config.token, channelId);
 
     const imagePaths: string[] = [];
+    const pdfPaths: { path: string; filename: string }[] = [];
     let voicePath: string | null = null;
     let voiceTranscript: string | null = null;
 
@@ -793,6 +802,17 @@ async function handleMessageCreate(token: string, message: DiscordMessage): Prom
           if (p) imagePaths.push(p);
         } catch (err) {
           console.error(`[Discord] Failed to download image for ${label}: ${err instanceof Error ? err.message : err}`);
+        }
+      }
+    }
+
+    if (hasPdf) {
+      for (const att of pdfAttachments) {
+        try {
+          const p = await downloadDiscordAttachment(att, "pdf");
+          if (p) pdfPaths.push({ path: p, filename: att.filename });
+        } catch (err) {
+          console.error(`[Discord] Failed to download PDF for ${label}: ${err instanceof Error ? err.message : err}`);
         }
       }
     }
@@ -973,6 +993,18 @@ async function handleMessageCreate(token: string, message: DiscordMessage): Prom
       );
     } else if (hasImage) {
       promptParts.push("The user attached an image, but downloading it failed. Respond and ask them to resend.");
+    }
+    if (pdfPaths.length > 0) {
+      for (const { path, filename } of pdfPaths) {
+        promptParts.push(`PDF path: ${path} (original filename: ${filename})`);
+      }
+      promptParts.push(
+        pdfPaths.length === 1
+          ? "The user attached a PDF. Use the Read tool on the PDF path to inspect its contents. For PDFs longer than 10 pages, pass a pages range (e.g., pages: \"1-5\")."
+          : `The user attached ${pdfPaths.length} PDFs. Use the Read tool on each PDF path to inspect contents. For PDFs longer than 10 pages, pass a pages range (e.g., pages: \"1-5\").`,
+      );
+    } else if (hasPdf) {
+      promptParts.push("The user attached a PDF, but downloading it failed. Respond and ask them to resend.");
     }
     if (voiceTranscript) {
       promptParts.push(`Voice transcript: ${voiceTranscript}`);
