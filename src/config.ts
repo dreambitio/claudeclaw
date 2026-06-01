@@ -249,10 +249,14 @@ function parseSettings(raw: Record<string, any>): Settings {
       allowedUserIds: raw.telegram?.allowedUserIds ?? [],
     },
     discord: {
-      token: typeof raw.discord?.token === "string" ? raw.discord.token.trim() : "",
-      allowedUserIds: Array.isArray(raw.discord?.allowedUserIds)
+      token: typeof raw.discord?.token === "string" && raw.discord.token.trim()
+        ? raw.discord.token.trim()
+        : (process.env.DISCORD_TOKEN ?? ""),
+      allowedUserIds: Array.isArray(raw.discord?.allowedUserIds) && raw.discord.allowedUserIds.length > 0
           ? raw.discord.allowedUserIds.map(String)
-          : [],
+          : process.env.DISCORD_ALLOWED_USERS
+            ? process.env.DISCORD_ALLOWED_USERS.split(",").map((s) => s.trim()).filter(Boolean)
+            : [],
       listenChannels: Array.isArray(raw.discord?.listenChannels)
         ? raw.discord.listenChannels.map(String)
         : [],
