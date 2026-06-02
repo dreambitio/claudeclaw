@@ -111,6 +111,11 @@ let gatewaySessionId: string | null = null;
 let resumeGatewayUrl: string | null = null;
 let heartbeatAcked = true;
 let running = true;
+// Guards against scheduling two reconnects at once (e.g. zombie-detection and a
+// late onclose both firing). Cleared when a connect attempt actually begins.
+let reconnecting = false;
+// Token of the active connection, so the heartbeat timer can force a reconnect.
+let currentToken: string | null = null;
 let discordDebug = false;
 
 // Bot identity (populated from READY)
@@ -1769,12 +1774,44 @@ function startHeartbeat(): void {
   }, Math.random() * heartbeatIntervalMs);
   heartbeatTimer = setInterval(() => {
     if (!heartbeatAcked) {
-      debugLog("Heartbeat not acked, reconnecting");
-      ws?.close(4000, "Heartbeat timeout");
+      // Zombie socket: no ACK since last beat. ws.close() alone can hang for
+      // minutes on a half-open connection (onclose never fires), so detach the
+      // dead socket and force a reconnect directly instead of waiting for it.
+      console.log("[Discord] Heartbeat not acked — forcing reconnect (zombie socket)");
+      forceReconnect(currentToken);
       return;
     }
     sendHeartbeat();
   }, heartbeatIntervalMs);
+}
+
+// Tear down the current socket without waiting for onclose, then reconnect.
+function forceReconnect(token: string): void {
+  stopHeartbeat();
+  const dead = ws;
+  ws = null;
+  if (dead) {
+    // Detach handlers so a late onclose on the dead socket can't schedule a
+    // second, competing reconnect after we've already moved on.
+    dead.onclose = null;
+    dead.onmessage = null;
+    dead.onerror = null;
+    try {
+      dead.close(4000, "zombie");
+    } catch {
+      // best-effort
+    }
+  }
+  scheduleReconnect(token);
+}
+
+// Schedule exactly one reconnect; deduped via `reconnecting` so overlapping
+// triggers (zombie detection + onclose) don't open two sockets.
+function scheduleReconnect(token: string): void {
+  if (reconnecting || !running) return;
+  reconnecting = true;
+  const reconnectUrl = gatewaySessionId && resumeGatewayUrl ? resumeGatewayUrl : undefined;
+  setTimeout(() => connectGateway(token, reconnectUrl), 3000 + Math.random() * 4000);
 }
 
 function stopHeartbeat(): void {
@@ -1839,6 +1876,7 @@ function stopThreadSubscriptionHeartbeat(): void {
 function resetGatewayState(): void {
   heartbeatIntervalMs = 0;
   heartbeatAcked = true;
+  reconnecting = false;
   lastSequence = null;
   gatewaySessionId = null;
   resumeGatewayUrl = null;
@@ -2100,6 +2138,10 @@ function connectGateway(token: string, url?: string): void {
   const gatewayUrl = url || GATEWAY_URL;
   debugLog(`Connecting to gateway: ${gatewayUrl}`);
 
+  // A connect attempt is now in flight — allow future drops to schedule again.
+  currentToken = token;
+  reconnecting = false;
+
   ws = new WebSocket(gatewayUrl);
 
   ws.onopen = () => {
@@ -2128,11 +2170,9 @@ function connectGateway(token: string, url?: string): void {
 
     // Reconnect and RESUME so Discord replays events missed during the gap — a
     // fresh reconnect would drop them (this was the cause of "messages ignored").
-    // Target the dedicated resume URL from READY; HELLO picks resume-vs-identify
-    // from the preserved session state. If the resume is rejected, Discord sends
-    // INVALID_SESSION and we fall back to a fresh IDENTIFY.
-    const reconnectUrl = gatewaySessionId && resumeGatewayUrl ? resumeGatewayUrl : undefined;
-    setTimeout(() => connectGateway(token, reconnectUrl), 3000 + Math.random() * 4000);
+    // HELLO picks resume-vs-identify from the preserved session state; if the
+    // resume is rejected, Discord sends INVALID_SESSION and we IDENTIFY fresh.
+    scheduleReconnect(token);
   };
 
   ws.onerror = () => {
