@@ -145,15 +145,18 @@ async function discordApi<T>(
   method: string,
   endpoint: string,
   body?: unknown,
+  opts?: { signal?: AbortSignal },
 ): Promise<T> {
-  let res = await fetch(`${DISCORD_API}${endpoint}`, {
+  const init: RequestInit = {
     method,
     headers: {
       Authorization: `Bot ${token}`,
       "Content-Type": "application/json",
     },
     body: body ? JSON.stringify(body) : undefined,
-  });
+    signal: opts?.signal,
+  };
+  let res = await fetch(`${DISCORD_API}${endpoint}`, init);
 
   // Rate limit handling — loop instead of recursion, cap retry at 30s
   while (res.status === 429) {
@@ -161,14 +164,7 @@ async function discordApi<T>(
     const retryMs = Math.min(Math.ceil(data.retry_after * 1000), 30_000);
     debugLog(`Rate limited on ${method} ${endpoint}, retrying in ${retryMs}ms`);
     await Bun.sleep(retryMs);
-    res = await fetch(`${DISCORD_API}${endpoint}`, {
-      method,
-      headers: {
-        Authorization: `Bot ${token}`,
-        "Content-Type": "application/json",
-      },
-      body: body ? JSON.stringify(body) : undefined,
-    });
+    res = await fetch(`${DISCORD_API}${endpoint}`, init);
   }
 
   if (!res.ok) {
@@ -446,16 +442,33 @@ function isSnowflake(id: string): boolean {
   return /^\d+$/.test(id);
 }
 
-async function withTimeout<T>(p: Promise<T>, ms: number, label: string): Promise<T> {
-  let timer: ReturnType<typeof setTimeout> | undefined;
-  const timeout = new Promise<never>((_, reject) => {
-    timer = setTimeout(() => reject(new Error(`timeout after ${ms}ms: ${label}`)), ms);
-  });
+// Run an API call under a deadline that actually aborts the underlying fetch,
+// so a timed-out request doesn't leak an open connection.
+async function withAbortTimeout<T>(
+  ms: number,
+  label: string,
+  fn: (signal: AbortSignal) => Promise<T>,
+): Promise<T> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(new Error(`timeout after ${ms}ms: ${label}`)), ms);
   try {
-    return await Promise.race([p, timeout]);
+    return await fn(controller.signal);
   } finally {
-    if (timer) clearTimeout(timer);
+    clearTimeout(timer);
   }
+}
+
+async function withRetry<T>(attempts: number, baseDelayMs: number, fn: () => Promise<T>): Promise<T> {
+  let lastErr: unknown;
+  for (let attempt = 0; attempt < attempts; attempt++) {
+    try {
+      return await fn();
+    } catch (err) {
+      lastErr = err;
+      if (attempt < attempts - 1) await Bun.sleep(baseDelayMs * (attempt + 1));
+    }
+  }
+  throw lastErr;
 }
 
 async function rejoinThreads(token: string): Promise<void> {
@@ -485,10 +498,8 @@ async function rejoinThreads(token: string): Promise<void> {
           // knownThreads only ever holds threads, so skip the type lookup for those.
           let parentId = knownThreads.get(id)?.parentId;
           if (parentId === undefined) {
-            const ch = await withTimeout(
-              discordApi<{ type: number; parent_id?: string }>(token, "GET", `/channels/${id}`),
-              OP_TIMEOUT_MS,
-              `GET channel ${id}`,
+            const ch = await withAbortTimeout(OP_TIMEOUT_MS, `GET channel ${id}`, (signal) =>
+              discordApi<{ type: number; parent_id?: string }>(token, "GET", `/channels/${id}`, undefined, { signal }),
             );
             // Plain channels need no join — leave their session, just don't rejoin.
             if (!THREAD_CHANNEL_TYPES.has(ch.type)) {
@@ -498,10 +509,11 @@ async function rejoinThreads(token: string): Promise<void> {
             parentId = ch.parent_id;
           }
 
-          await withTimeout(
-            discordApi(token, "PUT", `/channels/${id}/thread-members/@me`),
-            OP_TIMEOUT_MS,
-            `join thread ${id}`,
+          // Retry the join once with backoff — these are the calls that flake on a slow gateway.
+          await withRetry(2, 1000, () =>
+            withAbortTimeout(OP_TIMEOUT_MS, `join thread ${id}`, (signal) =>
+              discordApi(token, "PUT", `/channels/${id}/thread-members/@me`, undefined, { signal }),
+            ),
           );
           if (parentId && !knownThreads.has(id)) {
             knownThreads.set(id, { parentId });
