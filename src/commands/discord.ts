@@ -22,6 +22,7 @@ const GatewayOp = {
   DISPATCH: 0,
   HEARTBEAT: 1,
   IDENTIFY: 2,
+  RESUME: 6,
   RECONNECT: 7,
   INVALID_SESSION: 9,
   HELLO: 10,
@@ -106,6 +107,8 @@ let heartbeatJitterTimer: ReturnType<typeof setTimeout> | null = null;
 let threadSubscriptionTimer: ReturnType<typeof setInterval> | null = null;
 let lastSequence: number | null = null;
 let gatewaySessionId: string | null = null;
+// Dedicated resume URL Discord hands us in READY; used to RESUME after a drop.
+let resumeGatewayUrl: string | null = null;
 let heartbeatAcked = true;
 let running = true;
 let discordDebug = false;
@@ -1819,7 +1822,9 @@ function startThreadSubscriptionHeartbeat(token: string): void {
     const config = getSettings().discord;
     for (const [threadId, info] of knownThreads.entries()) {
       if (config.channelProjects?.[info.parentId]) {
-        discordApi(token, "PUT", `/channels/${threadId}/thread-members/@me`).catch(() => {});
+        withAbortTimeout(8000, `keepalive join ${threadId}`, (signal) =>
+          discordApi(token, "PUT", `/channels/${threadId}/thread-members/@me`, undefined, { signal }),
+        ).catch(() => {});
       }
     }
   }, 10 * 60 * 1000);
@@ -1836,12 +1841,25 @@ function resetGatewayState(): void {
   heartbeatAcked = true;
   lastSequence = null;
   gatewaySessionId = null;
+  resumeGatewayUrl = null;
   readyGuildIds = null;
   startupMessageSent = false;
   botUserId = null;
   botUsername = null;
   applicationId = null;
   knownThreads.clear();
+}
+
+function sendResume(token: string): void {
+  debugLog(`Resuming session ${gatewaySessionId} at seq ${lastSequence}`);
+  sendWs({
+    op: GatewayOp.RESUME,
+    d: {
+      token,
+      session_id: gatewaySessionId,
+      seq: lastSequence,
+    },
+  });
 }
 
 function sendIdentify(token: string): void {
@@ -1875,6 +1893,10 @@ function handleDispatch(token: string, eventName: string, data: any): void {
   switch (eventName) {
     case "READY":
       gatewaySessionId = data.session_id;
+      // resume_gateway_url has no query string — append the version/encoding we use.
+      resumeGatewayUrl = data.resume_gateway_url
+        ? `${data.resume_gateway_url}/?v=10&encoding=json`
+        : null;
       botUserId = data.user.id;
       botUsername = data.user.username;
       applicationId = data.application.id;
@@ -1884,6 +1906,11 @@ function handleDispatch(token: string, eventName: string, data: any): void {
       registerSlashCommands(token).catch((err) =>
         console.error(`[Discord] Failed to register slash commands: ${err}`),
       );
+      break;
+
+    case "RESUMED":
+      // Resumed an existing session; Discord has replayed the events we missed.
+      console.log(`[Discord] Resumed session ${gatewaySessionId} (seq ${lastSequence})`);
       break;
 
     case "MESSAGE_CREATE":
@@ -1911,10 +1938,12 @@ function handleDispatch(token: string, eventName: string, data: any): void {
             const key = `${thread.parent_id}:${taskMatch[1]}`;
             if (!taskIdToThread.has(key)) taskIdToThread.set(key, thread.id);
           }
-          // Rejoin unconditionally — Discord only delivers MESSAGE_CREATE to thread members
-          discordApi(token, "PUT", `/channels/${thread.id}/thread-members/@me`).catch((err) =>
-            console.error(`[Discord] Failed to rejoin thread ${thread.id}: ${err}`)
-          );
+          // Rejoin unconditionally — Discord only delivers MESSAGE_CREATE to thread
+          // members. Bounded by an abort-timeout so a flaky network can't pile up
+          // hanging fetches and starve the gateway heartbeat.
+          withAbortTimeout(8000, `join thread ${thread.id}`, (signal) =>
+            discordApi(token, "PUT", `/channels/${thread.id}/thread-members/@me`, undefined, { signal }),
+          ).catch((err) => console.error(`[Discord] Failed to rejoin thread ${thread.id}: ${err}`));
           console.log(`[Discord]   thread: ${thread.id} name="${thread.name}" parent=${thread.parent_id}`);
         }
       } else {
@@ -2016,9 +2045,9 @@ function handleDispatch(token: string, eventName: string, data: any): void {
         console.log(`[Discord] THREAD_LIST_SYNC: ${data.threads.length} thread(s)`);
         for (const thread of data.threads) {
           knownThreads.set(thread.id, { parentId: thread.parent_id });
-          discordApi(token, "PUT", `/channels/${thread.id}/thread-members/@me`).catch((err) =>
-            debugLog(`Failed to rejoin thread ${thread.id} on THREAD_LIST_SYNC: ${err}`)
-          );
+          withAbortTimeout(8000, `join thread ${thread.id}`, (signal) =>
+            discordApi(token, "PUT", `/channels/${thread.id}/thread-members/@me`, undefined, { signal }),
+          ).catch((err) => debugLog(`Failed to rejoin thread ${thread.id} on THREAD_LIST_SYNC: ${err}`));
         }
       }
       break;
@@ -2032,7 +2061,12 @@ function handleGatewayPayload(token: string, payload: GatewayPayload): void {
     case GatewayOp.HELLO:
       heartbeatIntervalMs = payload.d.heartbeat_interval;
       startHeartbeat();
-      sendIdentify(token);
+      // RESUME if we have a live session (replays missed events); otherwise IDENTIFY fresh.
+      if (gatewaySessionId && lastSequence !== null) {
+        sendResume(token);
+      } else {
+        sendIdentify(token);
+      }
       break;
 
     case GatewayOp.HEARTBEAT_ACK:
@@ -2092,10 +2126,13 @@ function connectGateway(token: string, url?: string): void {
       return;
     }
 
-    // Always reconnect fresh — session resume skips GUILD_CREATE which breaks thread event delivery
-    gatewaySessionId = null;
-    lastSequence = null;
-    setTimeout(() => connectGateway(token), 3000 + Math.random() * 4000);
+    // Reconnect and RESUME so Discord replays events missed during the gap — a
+    // fresh reconnect would drop them (this was the cause of "messages ignored").
+    // Target the dedicated resume URL from READY; HELLO picks resume-vs-identify
+    // from the preserved session state. If the resume is rejected, Discord sends
+    // INVALID_SESSION and we fall back to a fresh IDENTIFY.
+    const reconnectUrl = gatewaySessionId && resumeGatewayUrl ? resumeGatewayUrl : undefined;
+    setTimeout(() => connectGateway(token, reconnectUrl), 3000 + Math.random() * 4000);
   };
 
   ws.onerror = () => {
