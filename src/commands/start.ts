@@ -6,7 +6,7 @@ import { writeState, type StateData } from "../statusline";
 import { cronMatches, nextCronMatch } from "../cron";
 import { clearJobSchedule, loadJobs } from "../jobs";
 import { writePidFile, cleanupPidFile, checkExistingDaemon } from "../pid";
-import { initConfig, loadSettings, reloadSettings, resolvePrompt, type HeartbeatConfig, type Settings } from "../config";
+import { initConfig, loadSettings, getSettings, reloadSettings, resolvePrompt, type HeartbeatConfig, type Settings } from "../config";
 import { getDayAndMinuteAtOffset } from "../timezone";
 import { startWebUi, type WebServerHandle } from "../web";
 import type { Job } from "../jobs";
@@ -378,10 +378,18 @@ export async function start(args: string[] = []) {
 
   async function initDiscord(token: string) {
     if (token && token !== discordToken) {
-      const { startGateway, sendMessageToUser, sendMessage, stopGateway, postTaskAnnouncement } = await import("./discord");
+      const { startGateway, sendMessageToUser, sendMessage, stopGateway, postTaskAnnouncement, setGatewayDownAlertCallback } = await import("./discord");
       if (discordToken) stopGateway();
       startGateway(debugFlag);
       discordStopGateway = stopGateway;
+      // Alert on Telegram when Discord has been unreachable for >2 min so the
+      // user never has to wonder why Discord went silent.
+      setGatewayDownAlertCallback(() => {
+        const tgUsers = getSettings().telegram.allowedUserIds;
+        if (telegramSend && tgUsers.length > 0) {
+          telegramSend(tgUsers[0], "⚡ Discord gateway has been down >2 min — still trying to reconnect.").catch(() => {});
+        }
+      });
       discordSendToUser = (userId, text) => sendMessageToUser(token, userId, text);
       discordSendToChannel = (channelId, text) => sendMessage(token, channelId, text);
       discordPostTaskAnnouncement = (channelId, taskId, taskTitle) => postTaskAnnouncement(token, channelId, taskId, taskTitle);

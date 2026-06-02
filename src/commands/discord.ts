@@ -119,6 +119,11 @@ let currentToken: string | null = null;
 // Fires if a freshly-opened socket never reaches HELLO (stuck mid-handshake on a
 // half-open VM connection) — without this the gateway can wedge with no recovery.
 let connectWatchdog: ReturnType<typeof setTimeout> | null = null;
+// Optional callback wired from start.ts to send a Telegram alert when the
+// Discord gateway has been down for longer than DOWN_ALERT_MS.
+let onGatewayDownAlert: (() => void) | null = null;
+let gatewayDownTimer: ReturnType<typeof setTimeout> | null = null;
+const DOWN_ALERT_MS = 2 * 60 * 1000; // 2 minutes
 let discordDebug = false;
 
 // Bot identity (populated from READY)
@@ -241,8 +246,20 @@ async function sendMessage(
     if (components && i + MAX_LEN >= formatted.length) {
       body.components = components;
     }
-    const msg = await discordApi<{ id: string }>(token, "POST", `/channels/${channelId}/messages`, body);
-    lastMessageId = msg.id;
+    // Retry on transient network errors (VM socket drops) before giving up.
+    let msg: { id: string } | null = null;
+    for (let attempt = 0; attempt < 3; attempt++) {
+      try {
+        msg = await withAbortTimeout(10_000, `send msg ${channelId}`, (signal) =>
+          discordApi<{ id: string }>(token, "POST", `/channels/${channelId}/messages`, body, { signal }),
+        );
+        break;
+      } catch (err) {
+        if (attempt === 2) throw err;
+        await Bun.sleep(1500 * (attempt + 1));
+      }
+    }
+    lastMessageId = msg!.id;
   }
   return lastMessageId;
 }
@@ -1815,11 +1832,26 @@ function forceReconnect(token: string | null): void {
   scheduleReconnect(token);
 }
 
+function startGatewayDownTimer(): void {
+  if (gatewayDownTimer) return;
+  gatewayDownTimer = setTimeout(() => {
+    gatewayDownTimer = null;
+    console.log("[Discord] Gateway has been down >2 min — firing down-alert");
+    onGatewayDownAlert?.();
+  }, DOWN_ALERT_MS);
+}
+
+function clearGatewayDownTimer(): void {
+  if (gatewayDownTimer) clearTimeout(gatewayDownTimer);
+  gatewayDownTimer = null;
+}
+
 // Schedule exactly one reconnect; deduped via `reconnecting` so overlapping
 // triggers (zombie detection + onclose) don't open two sockets.
 function scheduleReconnect(token: string): void {
   if (reconnecting || !running) return;
   reconnecting = true;
+  startGatewayDownTimer();
   const reconnectUrl = gatewaySessionId && resumeGatewayUrl ? resumeGatewayUrl : undefined;
   setTimeout(() => connectGateway(token, reconnectUrl), 3000 + Math.random() * 4000);
 }
@@ -2109,6 +2141,7 @@ function handleGatewayPayload(token: string, payload: GatewayPayload): void {
     case GatewayOp.HELLO:
       // Socket is alive and Discord is talking — connect attempt succeeded.
       clearConnectWatchdog();
+      clearGatewayDownTimer();
       heartbeatIntervalMs = payload.d.heartbeat_interval;
       startHeartbeat();
       // RESUME if we have a live session (replays missed events); otherwise IDENTIFY fresh.
@@ -2207,11 +2240,17 @@ function connectGateway(token: string, url?: string): void {
 /** Send a message to a specific channel (used by heartbeat forwarding) */
 export { sendMessage, sendMessageToUser };
 
+/** Register a callback to fire when Discord gateway has been down >2 min. */
+export function setGatewayDownAlertCallback(cb: () => void): void {
+  onGatewayDownAlert = cb;
+}
+
 /** Stop gateway connection and clear runtime state (used for token rotation/hot reload). */
 export function stopGateway(): void {
   running = false;
   stopHeartbeat();
   clearConnectWatchdog();
+  clearGatewayDownTimer();
   stopThreadSubscriptionHeartbeat();
   if (ws) {
     try {

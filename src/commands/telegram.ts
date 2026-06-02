@@ -286,11 +286,17 @@ function extractTelegramCommand(text: string): string | null {
   return firstToken.split("@", 1)[0].toLowerCase();
 }
 
-async function callApi<T>(token: string, method: string, body?: Record<string, unknown>): Promise<T> {
+async function callApi<T>(
+  token: string,
+  method: string,
+  body?: Record<string, unknown>,
+  opts?: { signal?: AbortSignal },
+): Promise<T> {
   const res = await fetch(`${API_BASE}${token}/${method}`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: body ? JSON.stringify(body) : undefined,
+    signal: opts?.signal,
   });
   if (!res.ok) {
     throw new Error(`Telegram API ${method}: ${res.status} ${res.statusText}`);
@@ -1019,13 +1025,25 @@ async function poll(): Promise<void> {
   // Register available skills as bot command menu (non-blocking)
   registerBotCommands(config.token).catch(() => {});
 
+  // Long-poll timeout (sec) — Telegram holds the request open this long.
+  // The fetch abort fires at POLL_TIMEOUT_MS + some headroom so we cancel a
+  // truly stuck socket before the next iteration starts.
+  const LONG_POLL_SEC = 30;
+  const ABORT_TIMEOUT_MS = (LONG_POLL_SEC + 10) * 1000;
+  let consecutiveErrors = 0;
+
   while (running) {
+    const controller = new AbortController();
+    const abortTimer = setTimeout(() => controller.abort(new Error("poll timeout")), ABORT_TIMEOUT_MS);
     try {
       const data = await callApi<{ ok: boolean; result: TelegramUpdate[] }>(
         config.token,
         "getUpdates",
-        { offset, timeout: 30, allowed_updates: ["message", "my_chat_member", "callback_query"] }
+        { offset, timeout: LONG_POLL_SEC, allowed_updates: ["message", "my_chat_member", "callback_query"] },
+        { signal: controller.signal },
       );
+      clearTimeout(abortTimer);
+      consecutiveErrors = 0;
 
       if (!data.ok || !data.result.length) continue;
 
@@ -1057,9 +1075,18 @@ async function poll(): Promise<void> {
         }
       }
     } catch (err) {
+      clearTimeout(abortTimer);
       if (!running) break;
-      console.error(`[Telegram] Poll error: ${err instanceof Error ? err.message : err}`);
-      await Bun.sleep(5000);
+      consecutiveErrors++;
+      // Progressive backoff: 2s, 4s, 8s, cap 30s — prevents log spam on
+      // sustained network outage and gives the VM network time to recover.
+      const backoffMs = Math.min(2000 * consecutiveErrors, 30_000);
+      if (consecutiveErrors === 1) {
+        console.error(`[Telegram] Poll error: ${err instanceof Error ? err.message : err}`);
+      } else {
+        console.error(`[Telegram] Poll error (${consecutiveErrors} consecutive): ${err instanceof Error ? err.message : err}`);
+      }
+      await Bun.sleep(backoffMs);
     }
   }
 }
