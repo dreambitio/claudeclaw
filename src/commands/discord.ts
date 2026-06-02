@@ -116,6 +116,9 @@ let running = true;
 let reconnecting = false;
 // Token of the active connection, so the heartbeat timer can force a reconnect.
 let currentToken: string | null = null;
+// Fires if a freshly-opened socket never reaches HELLO (stuck mid-handshake on a
+// half-open VM connection) — without this the gateway can wedge with no recovery.
+let connectWatchdog: ReturnType<typeof setTimeout> | null = null;
 let discordDebug = false;
 
 // Bot identity (populated from READY)
@@ -1785,9 +1788,16 @@ function startHeartbeat(): void {
   }, heartbeatIntervalMs);
 }
 
+function clearConnectWatchdog(): void {
+  if (connectWatchdog) clearTimeout(connectWatchdog);
+  connectWatchdog = null;
+}
+
 // Tear down the current socket without waiting for onclose, then reconnect.
-function forceReconnect(token: string): void {
+function forceReconnect(token: string | null): void {
+  if (!token) return;
   stopHeartbeat();
+  clearConnectWatchdog();
   const dead = ws;
   ws = null;
   if (dead) {
@@ -2097,6 +2107,8 @@ function handleGatewayPayload(token: string, payload: GatewayPayload): void {
 
   switch (payload.op) {
     case GatewayOp.HELLO:
+      // Socket is alive and Discord is talking — connect attempt succeeded.
+      clearConnectWatchdog();
       heartbeatIntervalMs = payload.d.heartbeat_interval;
       startHeartbeat();
       // RESUME if we have a live session (replays missed events); otherwise IDENTIFY fresh.
@@ -2144,6 +2156,15 @@ function connectGateway(token: string, url?: string): void {
 
   ws = new WebSocket(gatewayUrl);
 
+  // If the handshake stalls (half-open VM socket), neither onopen nor onclose
+  // fires and the gateway wedges silently. Watchdog forces a retry if HELLO
+  // hasn't arrived in time.
+  clearConnectWatchdog();
+  connectWatchdog = setTimeout(() => {
+    console.log("[Discord] Connect watchdog: no HELLO in 25s — forcing reconnect");
+    forceReconnect(token);
+  }, 25_000);
+
   ws.onopen = () => {
     debugLog("Gateway WebSocket opened");
   };
@@ -2160,6 +2181,7 @@ function connectGateway(token: string, url?: string): void {
   ws.onclose = (event) => {
     debugLog(`Gateway closed: code=${event.code} reason=${event.reason}`);
     stopHeartbeat();
+    clearConnectWatchdog();
     if (!running) return;
 
     // Fatal close codes — do not reconnect
@@ -2189,6 +2211,7 @@ export { sendMessage, sendMessageToUser };
 export function stopGateway(): void {
   running = false;
   stopHeartbeat();
+  clearConnectWatchdog();
   stopThreadSubscriptionHeartbeat();
   if (ws) {
     try {
