@@ -468,6 +468,24 @@ export async function compactCurrentSession(): Promise<{ success: boolean; messa
     : { success: false, message: `❌ Compact failed (${existing.sessionId.slice(0, 8)})` };
 }
 
+// Transient network failures — common when the host VM's NAT drops the API
+// socket mid-stream — surface as a non-zero exit with a recognizable message.
+// We retry these with backoff so a blip recovers instead of bubbling up as a
+// hard "socket connection was closed unexpectedly" error to the user.
+function isTransientApiError(stdout: string, stderr: string): boolean {
+  const haystack = `${stdout}\n${stderr}`.toLowerCase();
+  return (
+    haystack.includes("socket connection was closed unexpectedly") ||
+    haystack.includes("socket hang up") ||
+    haystack.includes("econnreset") ||
+    haystack.includes("etimedout") ||
+    haystack.includes("enotfound") ||
+    haystack.includes("fetch failed") ||
+    haystack.includes("network error") ||
+    haystack.includes("connection error")
+  );
+}
+
 async function execClaude(name: string, prompt: string, threadId?: string, projectDir?: string): Promise<RunResult> {
   await mkdir(LOGS_DIR, { recursive: true });
 
@@ -579,6 +597,22 @@ async function execClaude(name: string, prompt: string, threadId?: string, proje
   const baseEnv = { ...cleanEnv } as Record<string, string>;
 
   let exec = await runClaudeOnce(args, primaryConfig.model, primaryConfig.api, baseEnv, timeoutMs, projectDir, threadId ?? "__global__");
+
+  // Retry transient network drops (VM NAT killing the API socket) before giving up.
+  const MAX_TRANSIENT_RETRIES = 3;
+  for (
+    let attempt = 1;
+    attempt <= MAX_TRANSIENT_RETRIES && exec.exitCode !== 0 && isTransientApiError(exec.rawStdout, exec.stderr);
+    attempt++
+  ) {
+    const backoffMs = 2000 * attempt;
+    console.warn(
+      `[${new Date().toLocaleTimeString()}] Transient API error (attempt ${attempt}/${MAX_TRANSIENT_RETRIES}); retrying in ${backoffMs}ms...`
+    );
+    await Bun.sleep(backoffMs);
+    exec = await runClaudeOnce(args, primaryConfig.model, primaryConfig.api, baseEnv, timeoutMs, projectDir, threadId ?? "__global__");
+  }
+
   const primaryRateLimit = extractRateLimitMessage(exec.rawStdout, exec.stderr);
   let usedFallback = false;
 
