@@ -437,24 +437,88 @@ async function applyJobDirectives(
 }
 
 // --- Thread rejoin helper ---
+
+// Discord channel types that are threads. Only threads can (and must) be joined
+// via thread-members/@me; plain channels deliver MESSAGE_CREATE without joining.
+const THREAD_CHANNEL_TYPES = new Set([10, 11, 12]);
+
+function isSnowflake(id: string): boolean {
+  return /^\d+$/.test(id);
+}
+
+async function withTimeout<T>(p: Promise<T>, ms: number, label: string): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(new Error(`timeout after ${ms}ms: ${label}`)), ms);
+  });
+  try {
+    return await Promise.race([p, timeout]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
 async function rejoinThreads(token: string): Promise<void> {
   const threadSessions = await listThreadSessions();
-  for (const ts of threadSessions) {
-    try {
-      await discordApi(token, "PUT", `/channels/${ts.threadId}/thread-members/@me`);
-      if (!knownThreads.has(ts.threadId)) {
-        const ch = await discordApi<{ parent_id?: string }>(token, "GET", `/channels/${ts.threadId}`);
-        if (ch.parent_id) {
-          knownThreads.set(ts.threadId, { parentId: ch.parent_id });
+  let rejoined = 0;
+  let skipped = 0;
+  const CONCURRENCY = 8;
+  const OP_TIMEOUT_MS = 8000;
+
+  // Batch to bound concurrent API calls — a reconnect storm shouldn't fan out
+  // 40+ simultaneous requests, and one slow thread shouldn't stall the rest.
+  for (let i = 0; i < threadSessions.length; i += CONCURRENCY) {
+    const batch = threadSessions.slice(i, i + CONCURRENCY);
+    await Promise.all(
+      batch.map(async (ts) => {
+        const id = ts.threadId;
+
+        // Sessions are keyed by channel_id, so this map holds both real threads
+        // and plain-channel sessions (plus legacy junk). Drop non-snowflake junk.
+        if (!isSnowflake(id)) {
+          await removeThreadSession(id);
+          console.log(`[Discord] Pruned invalid session entry: ${id}`);
+          return;
         }
-      }
-      console.log(`[Discord] Rejoined thread: ${ts.threadId}`);
-    } catch (err) {
-      console.error(`[Discord] Failed to rejoin thread ${ts.threadId}: ${err}`);
-    }
+
+        try {
+          // knownThreads only ever holds threads, so skip the type lookup for those.
+          let parentId = knownThreads.get(id)?.parentId;
+          if (parentId === undefined) {
+            const ch = await withTimeout(
+              discordApi<{ type: number; parent_id?: string }>(token, "GET", `/channels/${id}`),
+              OP_TIMEOUT_MS,
+              `GET channel ${id}`,
+            );
+            // Plain channels need no join — leave their session, just don't rejoin.
+            if (!THREAD_CHANNEL_TYPES.has(ch.type)) {
+              skipped++;
+              return;
+            }
+            parentId = ch.parent_id;
+          }
+
+          await withTimeout(
+            discordApi(token, "PUT", `/channels/${id}/thread-members/@me`),
+            OP_TIMEOUT_MS,
+            `join thread ${id}`,
+          );
+          if (parentId && !knownThreads.has(id)) {
+            knownThreads.set(id, { parentId });
+          }
+          rejoined++;
+          console.log(`[Discord] Rejoined thread: ${id}`);
+        } catch (err) {
+          console.error(`[Discord] Failed to rejoin thread ${id}: ${err}`);
+        }
+      }),
+    );
   }
-  if (threadSessions.length > 0) {
-    console.log(`[Discord] Rejoined ${threadSessions.length} thread(s) from sessions.json`);
+
+  if (rejoined > 0 || skipped > 0) {
+    console.log(
+      `[Discord] Rejoined ${rejoined} thread(s), skipped ${skipped} channel session(s) from sessions.json`,
+    );
   }
 }
 
