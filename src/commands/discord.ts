@@ -2212,9 +2212,11 @@ function connectGateway(token: string, url?: string): void {
   };
 
   ws.onclose = (event) => {
-    debugLog(`Gateway closed: code=${event.code} reason=${event.reason}`);
+    // Always log at INFO level so drop patterns are visible in daemon.log.
+    console.log(`[Discord][GW] Socket closed: code=${event.code} reason="${event.reason || "none"}" wasClean=${event.wasClean}`);
     stopHeartbeat();
     clearConnectWatchdog();
+    clearGatewayDownTimer();
     if (!running) return;
 
     // Fatal close codes — do not reconnect
@@ -2230,8 +2232,9 @@ function connectGateway(token: string, url?: string): void {
     scheduleReconnect(token);
   };
 
-  ws.onerror = () => {
-    // onclose will fire after onerror, reconnection handled there
+  ws.onerror = (err) => {
+    console.log(`[Discord][GW] Socket error: ${(err as any)?.message ?? err}`);
+    // onclose fires after onerror; reconnection handled there.
   };
 }
 
